@@ -162,28 +162,14 @@ fn clock_time(s: &str) -> bool {
         && &s[3..] <= "59"
 }
 fn timezone(v: Option<&Value>) -> bool {
-    // Intl 的 undefined 使用系统时区；IANA 名称大小写不敏感。数据库版本可能与 Node ICU 不同。
+    // Intl 的 undefined 使用系统时区。
     let Some(v) = v else {
         return true;
     };
-    let s = js_string(v);
-    if chrono_tz::TZ_VARIANTS
-        .iter()
-        .any(|tz| tz.name().eq_ignore_ascii_case(&s))
-    {
-        return true;
-    }
-    // 新版 Intl 也接受 ±HH、±HHMM、±HH:MM 固定偏移。
-    let b = s.as_bytes();
-    if b.first().is_some_and(|c| *c == b'+' || *c == b'-') {
-        let digits = s[1..].replace(':', "");
-        return (b.len() == 3 || b.len() == 5 || (b.len() == 6 && b[3] == b':'))
-            && digits.bytes().all(|b| b.is_ascii_digit())
-            && digits.len() >= 2
-            && &digits[..2] <= "23"
-            && (digits.len() == 2 || &digits[2..] <= "59");
-    }
-    false
+    // 判据直接复用运行时的 `Zone::parse`：区域名 + 固定偏移（±HH/±HHMM/±HH:MM）。
+    // 两处各写一套文法时，`quiet()`/`active_at()` 会在解析失败时静默退化成
+    // "不静默/恒活跃"，让校验通过的时区形同虚设。
+    crate::engine::policy::Zone::is_valid(&js_string(v))
 }
 fn url_host(raw: &Value, name: &str, schemes: &[&str]) -> std::result::Result<String, ConfigError> {
     // request_url 只解析 URL，不执行请求；复用现有 ureq 的 WHATWG url 实现，不加依赖。
@@ -1347,5 +1333,54 @@ mod tests {
         validate(&c).unwrap();
         assert_eq!(js_string(&json!(1e21)), "1e+21");
         assert_eq!(js_string(&json!(1e20)), "100000000000000000000");
+    }
+    /// 固定偏移必须与运行时 `Zone::parse` 一致：校验放行的写法要能真的解析出偏移。
+    /// 不一致时 `quiet()`/`active_at()` 会静默退化成"不静默/恒活跃"，配置形同虚设。
+    #[test]
+    fn fixed_offset_agrees_with_runtime_zone_parse() {
+        for good in [
+            "UTC", "GMT", "+00:00", "-00:00", "+01:00", "-05:00", "+0130", "+01", "-23:59",
+            "+23:59", "+19:00", "-18:00", "+0800", "+08", "Europe/Stockholm", "europe/stockholm",
+        ] {
+            let mut c = defaults();
+            set(&mut c, "agent.schedule.timezone", json!(good));
+            assert!(validate(&c).is_ok(), "should accept {good}");
+            assert!(
+                crate::engine::policy::local_minutes_of_day(0., Some(good)).is_some(),
+                "runtime cannot parse accepted zone {good}"
+            );
+        }
+        // Intl 的固定偏移文法是 ±HH / ±HHMM / ±HH:MM，冒号位置与位数都是文法的一部分。
+        for bad in [
+            "+1:00", "-1:00", "+0:60", "-0:60", "+000:", "+00:0", "+00::", "+0::00", "+:30",
+            "+90", "+99:99", "UTC+8", "GMT+1:00", "+013000", "  +01:00", "+01:00 ", "+",
+            "-", "+aa:bb",
+        ] {
+            let mut c = defaults();
+            set(&mut c, "agent.schedule.timezone", json!(bad));
+            assert!(validate(&c).is_err(), "should reject {bad}");
+        }
+    }
+    /// 同一判据也守着 quietHours；两条路径此前共用同一个宽松校验。
+    #[test]
+    fn quiet_hours_timezone_uses_the_same_grammar() {
+        for bad in ["+1:00", "+0:60", "+000:", "+24:00", "+23:60", "+013000"] {
+            let mut c = defaults();
+            set(
+                &mut c,
+                "agent.quietHours",
+                json!({"enabled": true, "start": 23, "end": 8, "timezone": bad}),
+            );
+            assert!(validate(&c).is_err(), "should reject quietHours {bad}");
+        }
+        for good in ["+01:00", "+0130", "Europe/Stockholm"] {
+            let mut c = defaults();
+            set(
+                &mut c,
+                "agent.quietHours",
+                json!({"enabled": true, "start": 23, "end": 8, "timezone": good}),
+            );
+            assert!(validate(&c).is_ok(), "should accept quietHours {good}");
+        }
     }
 }

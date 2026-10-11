@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 
 /// 时区：**两步解析**。
 ///
-/// 1. 先试固定偏移（`UTC`、`UTC+8`、`UTC-3`、`UTC+05:30`、`GMT+8`、`+08:00`）。
+/// 1. 先试固定偏移（`UTC`、`GMT`、`+08:00`、`+0130`、`+08`）。
 ///    它不需要时区数据库，也不受夏令时影响，覆盖绝大多数使用场景。
 /// 2. 再试 IANA 区域名（`Europe/Stockholm`）。只有确实需要夏令时的地方才用这一步，
 ///    它依赖时区数据库，代价更高。
@@ -25,6 +25,10 @@ pub enum Zone {
 }
 
 /// 解析固定偏移写法；不是偏移写法时返回 `None`，由调用方继续尝试区域名。
+///
+/// 文法只有 Intl 接受的三种形态：`±HH`、`±HHMM`、`±HH:MM`（小时恒2 位、分钟恒 2 位）。
+/// `config::validate` 复用本函数，保证"校验放行的时区"与"运行时能解析的时区"恒等——
+/// 否则静默时段与作息时段会在解析失败时静默退化成"不静默/恒活跃"。
 fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
     let upper = value.trim().to_ascii_uppercase();
     let rest = upper
@@ -41,16 +45,40 @@ fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
         _ => return None,
     };
     let body = &rest[1..];
-    let (hours, minutes) = body.split_once(':').unwrap_or((body, "0"));
-    let hours: i32 = hours.parse().ok()?;
-    let minutes: i32 = minutes.parse().ok()?;
-    if hours > 18 || minutes > 59 {
+    // 只接受 ±HH / ±HHMM / ±HH:MM；冒号位置与位数都是文法的一部分。
+    let digits: Vec<u8> = body.bytes().collect();
+    let (hours, minutes) = match digits.as_slice() {
+        [h1, h2] => (digit(*h1)? * 10 + digit(*h2)?, 0),
+        [h1, h2, m1, m2] => (digit(*h1)? * 10 + digit(*h2)?, digit(*m1)? * 10 + digit(*m2)?),
+        [h1, h2, b':', m1, m2] => {
+            (digit(*h1)? * 10 + digit(*h2)?, digit(*m1)? * 10 + digit(*m2)?)
+        }
+        _ => return None,
+    };
+    if hours > 23 || minutes > 59 {
         return None;
     }
     FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
 }
 
+/// 单个 ASCII 数字；非数字返回 None。
+fn digit(b: u8) -> Option<i32> {
+    if b.is_ascii_digit() {
+        Some(i32::from(b - b'0'))
+    } else {
+        None
+    }
+}
+
 impl Zone {
+    /// 校验用：能否作为时区解析（区域名或固定偏移）。
+    ///
+    /// `config::validate` 与运行时 `Zone::parse` 必须是同一个判据，否则会出现
+    /// "配置校验通过、运行时解析失败"的静默失效。配置值不容忍首尾空白（`Intl` 也不接受）。
+    pub fn is_valid(value: &str) -> bool {
+        value.trim() == value && Self::parse(value).is_some()
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         if let Some(fixed) = parse_fixed_offset(value) {
             return Some(Self::Fixed(fixed));
